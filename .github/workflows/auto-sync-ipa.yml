@@ -1,0 +1,131 @@
+name: Auto-sync and package YouTube Plus IPA
+
+on:
+  schedule:
+    - cron: '43 2,8,14,20 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: youtube-plus-auto-ipa-main
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      release_tag: ${{ steps.state.outputs.release_tag }}
+      upstream_sha: ${{ steps.state.outputs.upstream_sha }}
+      upstream_version: ${{ steps.state.outputs.upstream_version }}
+      build_needed: ${{ steps.state.outputs.build_needed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Non-force sync and detect the newest YouTube Plus release
+        id: state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IPA_SOURCE_URL: ${{ secrets.YOUTUBE_IPA_URL }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/dayanch96/YTLite.git
+          git fetch --no-tags upstream refs/heads/main:refs/remotes/upstream/main
+          upstream_sha="$(git rev-parse refs/remotes/upstream/main)"
+          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                merge --no-ff --no-edit refs/remotes/upstream/main
+            git push origin HEAD:main
+          fi
+          version_tag="$(gh api repos/dayanch96/YTLite/releases/latest --jq '.tag_name')"
+          [[ "$version_tag" =~ ^v[0-9]+(\.[0-9A-Za-z-]+)*$ ]] || { echo 'Unexpected upstream release tag.' >&2; exit 1; }
+          version="${version_tag#v}"
+          tag="yt-auto-${version}-${upstream_sha:0:12}"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_version=$version_tag" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+          if [[ -z "${IPA_SOURCE_URL:-}" ]]; then
+            echo 'build_needed=false' >> "$GITHUB_OUTPUT"
+            echo 'Waiting for secret YOUTUBE_IPA_URL: direct HTTPS link to your own decrypted YouTube IPA.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          [[ "$IPA_SOURCE_URL" == https://* ]] || { echo 'YOUTUBE_IPA_URL must use HTTPS.' >&2; exit 1; }
+          count="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name | select(endswith(".ipa"))] | length' 2>/dev/null || printf '0')"
+          if [[ "$count" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'build_needed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'build_needed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+  package:
+    needs: prepare
+    if: needs.prepare.outputs.build_needed == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Download user-provided decrypted YouTube IPA
+        shell: bash
+        env:
+          IPA_SOURCE_URL: ${{ secrets.YOUTUBE_IPA_URL }}
+        run: |
+          set -euo pipefail
+          [[ "${IPA_SOURCE_URL:-}" == https://* ]] || exit 1
+          curl --fail --location --silent --show-error --retry 2 --max-time 600 \
+            --output youtube.ipa "$IPA_SOURCE_URL"
+          unzip -tqq youtube.ipa
+          unzip -Z1 youtube.ipa | grep -E '^Payload/[^/]+\.app/Info\.plist$' >/dev/null
+      - name: Download latest official YouTube Plus tweak package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_TAG: ${{ needs.prepare.outputs.upstream_version }}
+        run: |
+          set -euo pipefail
+          gh release download "$VERSION_TAG" --repo dayanch96/YTLite \
+            --pattern 'com.dvntm.ytlite_*_iphoneos-arm.deb' --dir .
+          shopt -s nullglob
+          debs=(com.dvntm.ytlite_*_iphoneos-arm.deb)
+          (( ${#debs[@]} == 1 )) || { echo 'Expected one official tweak package.' >&2; exit 1; }
+          mv "${debs[0]}" ytplus.deb
+          test -s ytplus.deb
+      - name: Inject tweak and package YouTube Plus IPA
+        shell: bash
+        env:
+          VERSION_TAG: ${{ needs.prepare.outputs.upstream_version }}
+        run: |
+          set -euo pipefail
+          pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+          version="${VERSION_TAG#v}"
+          cyan -i youtube.ipa -o "YouTubePlus_${version}.ipa" -uwef ytplus.deb
+          unzip -tqq "YouTubePlus_${version}.ipa"
+      - name: Save IPA as draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
+          VERSION_TAG: ${{ needs.prepare.outputs.upstream_version }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          version="${VERSION_TAG#v}"
+          ipa="YouTubePlus_${version}.ipa"
+          test -s "$ipa"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json id >/dev/null 2>&1; then
+            draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
+            [[ "$draft" == true ]] || { echo 'Refusing upload to published release.' >&2; exit 1; }
+            gh release upload "$TAG" "$ipa" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$ipa" --repo "$GITHUB_REPOSITORY" \
+              --draft --title "YouTube Plus $VERSION_TAG / source ${UPSTREAM_SHA:0:12}" \
+              --notes "Built with official dayanch96/YTLite $VERSION_TAG tweak release, upstream commit $UPSTREAM_SHA. May require subscription. Unsigned IPA for manual installation only; do not publish third-party binaries."
+          fi
+          echo "IPA ready: https://github.com/$GITHUB_REPOSITORY/releases (draft)" >> "$GITHUB_STEP_SUMMARY"
