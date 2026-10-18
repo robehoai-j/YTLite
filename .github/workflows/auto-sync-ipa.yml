@@ -1,6 +1,10 @@
 name: Auto-sync and package YouTube Plus IPA
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/auto-sync-ipa.yml'
   schedule:
     - cron: '43 2,8,14,20 * * *'
   workflow_dispatch:
