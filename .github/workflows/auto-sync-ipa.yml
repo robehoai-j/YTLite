@@ -27,10 +27,20 @@ jobs:
       upstream_version: ${{ steps.state.outputs.upstream_version }}
       build_needed: ${{ steps.state.outputs.build_needed }}
     steps:
+      - name: Verify full upstream sync credential
+        shell: bash
+        env:
+          SYNC_TOKEN: ${{ secrets.YTLITE_SYNC_TOKEN }}
+        run: |
+          if [[ -z "${SYNC_TOKEN:-}" ]]; then
+            echo "::error::Missing YTLITE_SYNC_TOKEN. Configure a fine-grained PAT scoped to this repo with Contents and Workflows read/write permissions."
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
+          token: ${{ secrets.YTLITE_SYNC_TOKEN }}
       - name: Non-force sync and detect the newest YouTube Plus release
         id: state
         shell: bash
